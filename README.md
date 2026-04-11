@@ -19,7 +19,7 @@ Instalation et fonctionnement :
 👉 Ça ouvre une fenêtre noire (invite de commande)
 
 3. Lance le script
-- Dans la fenêtre, tape : python corrige.py "xxxx.ass"
+- Dans la fenêtre, tape : py corrige_qc_humain.py "xxxx.ass"
 - puis Entrée
 
 👉 Résultat
