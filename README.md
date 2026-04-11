@@ -6,7 +6,7 @@ Prérequis :  [LM Studio](https://lmstudio.ai/download), [Gemma 4](https://huggi
 Instalation et fonctionnement : 
 1. Mets tout au même endroit
 - Dans un dossier (par exemple sur le Bureau), mets :
-- ton script → corrige.py
+- ton script → py corrige_qc_humain.py
 - ton fichier → xxxx.ass
 
 2. Ouvre un terminal dans ce dossier
