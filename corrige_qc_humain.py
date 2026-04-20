@@ -9,21 +9,23 @@ MODEL = "local-model"  # remplace si besoin
 
 SYSTEM_PROMPT = (
     "Tu es un relecteur humain de sous-titres français. "
-    "Pour chaque ligne, tu dois produire deux choses : "
-    "1) une correction sûre minimale du texte principal ; "
-    "2) éventuellement une proposition plus naturelle, plus idiomatique ou plus française. "
-    "Règles absolues pour la correction sûre : "
-    "ne jamais changer le sens, "
-    "ne jamais changer le temps verbal sans nécessité, "
-    "ne jamais changer le tutoiement/vouvoiement, "
-    "ne jamais changer la personne grammaticale, "
-    "ne jamais modifier les tags ASS, "
-    "ne jamais modifier les \\N, "
-    "ne jamais supprimer les tirets de dialogue. "
-    "La correction sûre doit rester prudente. "
-    "La proposition QC peut être plus fluide, mais doit garder exactement le même sens. "
-    "Réponds uniquement en JSON valide avec ce format exact : "
-    '{"corrected":"...","suggestion":"...","reason":"..."}'
+    "Tu ne modifies jamais la ligne d'origine. "
+    "Tu dois seulement analyser le texte et produire un diagnostic. "
+    "Pour chaque ligne, tu dois répondre en JSON valide avec : "
+    "status = RAS | FAUTE_CERTAINE | A_VERIFIER ; "
+    "segment = segment précis concerné ou chaîne vide ; "
+    "proposal = correction ou reformulation proposée, ou chaîne vide ; "
+    "reason = explication courte. "
+    "Règles : "
+    "ne jamais changer le sens dans proposal ; "
+    "ne jamais changer le temps verbal sans nécessité ; "
+    "ne jamais changer le tutoiement/vouvoiement ; "
+    "ne jamais changer la personne grammaticale ; "
+    "si c'est seulement oral/familier mais pas fautif, utiliser A_VERIFIER au lieu de FAUTE_CERTAINE ; "
+    "ne jamais modifier les tags ASS ; "
+    "ne jamais modifier les \\N ; "
+    "réponds uniquement en JSON valide avec ce format exact : "
+    '{"status":"RAS","segment":"","proposal":"","reason":""}'
 )
 
 def parse_dialogue_line(line: str):
@@ -34,11 +36,30 @@ def parse_dialogue_line(line: str):
         return None
     return parts
 
-def extract_tags(text: str):
-    return re.findall(r"\{.*?\}", text)
-
 def strip_tags(text: str):
     return re.sub(r"\{.*?\}", "", text)
+
+def split_ass_segments(text: str):
+    parts = re.split(r"(\{.*?\})", text)
+    segments = []
+    for part in parts:
+        if not part:
+            continue
+        if re.fullmatch(r"\{.*?\}", part):
+            segments.append(("tag", part))
+        else:
+            segments.append(("text", part))
+    return segments
+
+def rebuild_from_segments(segments):
+    return "".join(value for _, value in segments)
+
+def risky_line(text: str) -> bool:
+    if r"\p1" in text or r"\p2" in text or r"\p3" in text:
+        return True
+    if len(strip_tags(text).strip()) <= 1:
+        return True
+    return False
 
 def normalize(text: str) -> str:
     text = text.lower()
@@ -48,174 +69,101 @@ def normalize(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def words(text: str):
-    return normalize(text).split()
-
 def similarity_ratio(a: str, b: str) -> float:
-    wa = set(words(a))
-    wb = set(words(b))
+    wa = set(normalize(a).split())
+    wb = set(normalize(b).split())
     if not wa and not wb:
         return 1.0
     if not wa or not wb:
         return 0.0
     return len(wa & wb) / max(len(wa | wb), 1)
 
-def dash_shape(text: str):
-    return [chunk.lstrip().startswith("-") for chunk in text.split("\\N")]
-
-def risky_line(text: str) -> bool:
-    if r"\p1" in text or r"\p2" in text or r"\p3" in text:
-        return True
-    if len(strip_tags(text).strip()) <= 1:
-        return True
-    return False
-
-def local_safe_fixes(text: str) -> str:
-    """
-    Corrections ultra sûres uniquement.
-    Zéro transformation risquée.
-    """
-
-    fixes = [
-        (r"\bje c\b", "je sais"),
-        (r"\bjé\b", "j'ai"),
-        (r"\bske\b", "ce que"),
-        (r"\bc koi\b", "c'est quoi"),
-        (r"\bsa va\b", "ça va"),
-        (r"\bquil\b", "qu'il"),
-    ]
-
-    for pat, repl in fixes:
-        text = re.sub(pat, repl, text, flags=re.IGNORECASE)
-
-    # participe passé (cas assez safe)
-    text = re.sub(
-        r"\bj['’]ai ([a-zàâäçéèêëîïôöùûüÿœæ-]+)er\b",
-        r"j'ai \1é",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    return text
-
-def register_shift(original: str, candidate: str) -> bool:
-    o = f" {normalize(original)} "
-    c = f" {normalize(candidate)} "
-
-    pairs = [
-        (" tu ", " vous "),
-        (" vous ", " tu "),
-        (" te ", " vous "),
-        (" ton ", " votre "),
-        (" ta ", " votre "),
-        (" tes ", " vos "),
-        (" votre ", " ton "),
-        (" vos ", " tes "),
-        (" ne vous ", " ne te "),
-        (" ne te ", " ne vous "),
-        (" pardonnez ", " pardonne "),
-        (" pardonne ", " pardonnez "),
-    ]
-    for a, b in pairs:
-        if a in o and b in c and a not in c:
-            return True
-    return False
-
-def tense_shift(original: str, candidate: str) -> bool:
-    o = normalize(original)
-    c = normalize(candidate)
-
-    suspicious_pairs = [
-        ("je me demande", "je m'étais demandé"),
-        ("je me disais", "je m'étais dit"),
-        ("je commençais", "j'ai commencé"),
-        ("je pense", "j'ai pensé"),
-        ("je finirai", "j'aurai fini"),
-        ("je suis", "j'ai été"),
-        ("je préfère", "j'ai préféré"),
-        ("on devait", "on n'était pas censés"),
-        ("tu veux rentrer", "tu veux entrer"),
-    ]
-    for a, b in suspicious_pairs:
-        if a in o and b in c:
-            return True
-    return False
-
-def broken_output(text: str) -> bool:
-    low = text.lower()
-    bad = [
-        "{\\n}",
-        "{\\N}",
-        "{\\c}",
-        "{\\anm}",
-        "{\\/i1}",
-        "j'ai suis",
-        "quoi que ce soit",
-        "voilà, tard",
-    ]
-    return any(x.lower() in low for x in bad)
-
-def valid_candidate(original: str, candidate: str, strict: bool = True):
-    if not candidate:
-        return False, "empty"
-
-    if extract_tags(original) != extract_tags(candidate):
-        return False, "tags"
-
-    if original.count("\\N") != candidate.count("\\N"):
-        return False, "N"
-
-    if original.endswith("\\N") != candidate.endswith("\\N"):
-        return False, "N_end"
-
-    if dash_shape(original) != dash_shape(candidate):
-        return False, "dash"
-
-    if broken_output(candidate):
-        return False, "broken"
-
-    if register_shift(original, candidate):
-        return False, "register"
-
-    if tense_shift(original, candidate):
-        return False, "tense"
-
-    threshold = 0.60 if strict else 0.42
-    if similarity_ratio(original, candidate) < threshold:
-        return False, "different"
-
-    return True, "ok"
+def normalize_diag_status(status: str) -> str:
+    status = (status or "RAS").strip().upper()
+    if status not in {"RAS", "FAUTE_CERTAINE", "A_VERIFIER"}:
+        return "A_VERIFIER"
+    return status
 
 def parse_model_json(raw: str):
     raw = raw.strip()
 
-    try:
-        data = json.loads(raw)
+    def normalize_data(data):
         return {
-            "corrected": str(data.get("corrected", "")).strip(),
-            "suggestion": str(data.get("suggestion", "")).strip(),
+            "status": normalize_diag_status(str(data.get("status", "RAS"))),
+            "segment": str(data.get("segment", "")).strip(),
+            "proposal": str(data.get("proposal", "")).strip(),
             "reason": str(data.get("reason", "")).strip(),
         }
+
+    # 1) JSON direct
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "status" in data:
+            return normalize_data(data)
     except Exception:
         pass
 
-    m = re.search(
-        r'\{.*"corrected"\s*:\s*".*?".*"suggestion"\s*:\s*".*?".*"reason"\s*:\s*".*?".*\}',
-        raw,
-        flags=re.DOTALL,
-    )
-    if m:
-        try:
-            data = json.loads(m.group(0))
-            return {
-                "corrected": str(data.get("corrected", "")).strip(),
-                "suggestion": str(data.get("suggestion", "")).strip(),
-                "reason": str(data.get("reason", "")).strip(),
-            }
-        except Exception:
-            pass
+    # 2) extraction de tous les objets JSON candidats
+    candidates = []
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
 
-    return None
+    for i, ch in enumerate(raw):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidates.append(raw[start:i + 1])
+                    start = None
+
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+            if isinstance(data, dict) and "status" in data:
+                return normalize_data(data)
+        except Exception:
+            continue
+
+    return {
+        "status": "A_VERIFIER",
+        "segment": "",
+        "proposal": "",
+        "reason": "réponse modèle non parsée proprement"
+    }
+
+def model_reply_is_generic(raw: str) -> bool:
+    low = raw.lower()
+    bad_snippets = [
+        "c'est entendu",
+        "je suis prêt à analyser",
+        "veuillez me transmettre",
+        "veuillez transmettre",
+        "le texte à analyser",
+        "pour chaque ligne",
+        "je produirai",
+        "json correspondant",
+        "l'utilisateur n'a pas fourni",
+    ]
+    return any(x in low for x in bad_snippets)
 
 def call_model(text: str):
     payload = {
@@ -225,13 +173,13 @@ def call_model(text: str):
             {
                 "role": "user",
                 "content": (
-                    "Analyse cette ligne de sous-titre.\n"
-                    "Consignes :\n"
-                    "- corrected = correction sûre et prudente\n"
-                    "- suggestion = tournure plus naturelle si utile, sinon chaîne vide\n"
-                    "- garde les tags ASS, les \\N et les tirets\n"
-                    "- conserve exactement le sens\n\n"
-                    f"{text}"
+                    "Analyse ce texte de sous-titre.\n"
+                    "Tu dois seulement diagnostiquer, pas corriger la ligne source.\n"
+                    "Utilise :\n"
+                    "- FAUTE_CERTAINE si faute claire\n"
+                    "- A_VERIFIER si formulation discutable ou trop orale\n"
+                    "- RAS si rien à signaler\n\n"
+                    f"TEXTE:\n{text}"
                 )
             }
         ],
@@ -241,57 +189,120 @@ def call_model(text: str):
     r = requests.post(URL, json=payload, timeout=120)
     r.raise_for_status()
     raw = r.json()["choices"][0]["message"]["content"]
+
+    if not raw or model_reply_is_generic(raw):
+        return {
+            "status": "A_VERIFIER",
+            "segment": "",
+            "proposal": "",
+            "reason": "réponse modèle générique / hors sujet"
+        }
+
     return parse_model_json(raw)
 
-def make_comment_line(parts, suggestion, reason):
+def clean_proposal_like_source(source_text: str, proposal: str):
+    proposal = re.sub(r"\{.*?\}", "", proposal).strip()
+    return proposal
+
+def validate_proposal(source_text: str, proposal: str):
+    if not proposal:
+        return False, "empty"
+
+    if source_text.count("\\N") != proposal.count("\\N"):
+        return False, "N"
+
+    if similarity_ratio(source_text, proposal) < 0.30:
+        return False, "different"
+
+    return True, "ok"
+
+def analyze_text_segment(segment_text: str):
+    if not segment_text.strip():
+        return {
+            "status": "RAS",
+            "segment": "",
+            "proposal": "",
+            "reason": ""
+        }
+
+    return call_model(segment_text)
+
+def merge_segment_diagnostics(text: str):
+    segments = split_ass_segments(text)
+
+    statuses = []
+    notes = []
+    proposals = []
+
+    for kind, value in segments:
+        if kind == "tag":
+            proposals.append(("tag", value))
+            continue
+
+        diag = analyze_text_segment(value)
+        status = normalize_diag_status(diag["status"])
+        segment = diag["segment"]
+        proposal = diag["proposal"]
+        reason = diag["reason"]
+
+        statuses.append(status)
+
+        if status != "RAS":
+            part = []
+            if segment:
+                part.append(f"segment: {segment}")
+            if reason:
+                part.append(f"raison: {reason}")
+            notes.append(" | ".join(part) if part else status)
+
+        if proposal:
+            proposal = clean_proposal_like_source(value, proposal)
+            ok, _ = validate_proposal(value, proposal)
+            if ok:
+                proposals.append(("text", proposal))
+            else:
+                proposals.append(("text", value))
+        else:
+            proposals.append(("text", value))
+
+    if "FAUTE_CERTAINE" in statuses:
+        final_status = "FAUTE_CERTAINE"
+    elif "A_VERIFIER" in statuses:
+        final_status = "A_VERIFIER"
+    else:
+        final_status = "RAS"
+
+    rebuilt_proposal = rebuild_from_segments(proposals)
+    if rebuilt_proposal == text:
+        rebuilt_proposal = ""
+
+    note = " || ".join(notes[:4])
+
+    return final_status, rebuilt_proposal, note
+
+def make_comment_line(parts, status, proposal, note):
     comment_parts = parts.copy()
     comment_parts[0] = "Comment: 0"
-    comment_parts[9] = f"QC: {suggestion}"
-    if reason:
-        comment_parts[9] += f" [{reason}]"
+
+    if status == "FAUTE_CERTAINE":
+        label = "QC-FAUTE"
+    elif status == "A_VERIFIER":
+        label = "QC-STYLE"
+    else:
+        label = "QC-RAS"
+
+    text = label
+    if proposal:
+        text += f": {proposal}"
+    if note:
+        text += f" [{note}]"
+
+    comment_parts[9] = text
     return ",".join(comment_parts)
-
-def process_line(text: str):
-    original = text
-
-    if risky_line(text):
-        return original, None, "ligne spéciale"
-
-    prepared = local_safe_fixes(text)
-
-    result = None
-    try:
-        result = call_model(prepared)
-    except Exception:
-        return original, None, "erreur modèle"
-
-    if result is None:
-        return original, None, "réponse invalide"
-
-    corrected = result["corrected"] or prepared
-    suggestion = result["suggestion"]
-    reason = result["reason"]
-
-    ok_corr, why_corr = valid_candidate(original, corrected, strict=True)
-    if not ok_corr:
-        # on garde éventuellement la pré-correction locale si elle est sûre
-        ok_pre, _ = valid_candidate(original, prepared, strict=True)
-        if ok_pre and prepared != original:
-            corrected = prepared
-        else:
-            corrected = original
-
-    final_suggestion = None
-    if suggestion and suggestion != corrected:
-        ok_sugg, _ = valid_candidate(corrected, suggestion, strict=False)
-        if ok_sugg:
-            final_suggestion = suggestion
-
-    return corrected, final_suggestion, reason
 
 def main():
     if len(sys.argv) < 2:
-        print('Usage : py corrige_qc_humain.py "mon_fichier.ass"')
+        print('Usage : py qc_comment_only.py "mon_fichier.ass"')
         return
 
     input_path = Path(sys.argv[1])
@@ -301,51 +312,79 @@ def main():
 
     original_text = input_path.read_text(encoding="utf-8-sig")
     backup_path = input_path.with_name(input_path.stem + "_backup.ass")
-    output_path = input_path.with_name(input_path.stem + "_qc_humain.ass")
+    output_path = input_path.with_name(input_path.stem + "_qc_comment.ass")
 
     backup_path.write_text(original_text, encoding="utf-8")
 
-    lines = original_text.splitlines()
+    source_lines = original_text.splitlines()
+    output_lines = []
 
-    changed = 0
-    comments = 0
-    kept = 0
+    dialogue_total = sum(1 for line in source_lines if line.startswith("Dialogue:"))
+    dialogue_index = 0
 
-    for idx, line in enumerate(lines):
+    faults = 0
+    checks = 0
+    ras = 0
+    skipped = 0
+
+    for line in source_lines:
         parts = parse_dialogue_line(line)
         if not parts:
+            output_lines.append(line)
             continue
 
+        dialogue_index += 1
         text = parts[9]
-        corrected, suggestion, reason = process_line(text)
 
-        if corrected != text:
-            changed += 1
-            print(f"[CORRECT] {text} -> {corrected}")
-            if reason:
-                print(f"  Raison : {reason}")
+        print(f"[{dialogue_index}/{dialogue_total}] Analyse : {text[:120]}")
+
+        output_lines.append(line)
+
+        if risky_line(text):
+            skipped += 1
+            print(f"[{dialogue_index}/{dialogue_total}] SKIP")
+            print("  Note : ligne spéciale ou non textuelle")
+            continue
+
+        status, proposal, note = merge_segment_diagnostics(text)
+
+        if status == "FAUTE_CERTAINE":
+            faults += 1
+            comment_line = make_comment_line(parts, status, proposal, note)
+            output_lines.append(comment_line)
+            print(f"[{dialogue_index}/{dialogue_total}] QC-FAUTE")
+            print(f"  Ligne : {text}")
+            if proposal:
+                print(f"  Proposition : {proposal}")
+            if note:
+                print(f"  Note : {note}")
+
+        elif status == "A_VERIFIER":
+            checks += 1
+            comment_line = make_comment_line(parts, status, proposal, note)
+            output_lines.append(comment_line)
+            print(f"[{dialogue_index}/{dialogue_total}] QC-STYLE")
+            print(f"  Ligne : {text}")
+            if proposal:
+                print(f"  Proposition : {proposal}")
+            if note:
+                print(f"  Note : {note}")
+
         else:
-            kept += 1
-            print(f"[KEEP] {text}")
+            ras += 1
+            print(f"[{dialogue_index}/{dialogue_total}] QC-OK")
+            print(f"  Ligne : {text}")
 
-        parts[9] = corrected
-        lines[idx] = ",".join(parts)
-
-        if suggestion:
-            comment_line = make_comment_line(parts, suggestion, reason)
-            lines.insert(idx + 1, comment_line)
-            comments += 1
-            print(f"[QC] {corrected} || {suggestion}")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    output_path.write_text("\n".join(output_lines), encoding="utf-8")
 
     print()
     print("Terminé.")
     print(f"Backup : {backup_path.name}")
     print(f"Sortie : {output_path.name}")
-    print(f"Lignes modifiées : {changed}")
-    print(f"Lignes avec commentaire QC : {comments}")
-    print(f"Lignes conservées : {kept}")
+    print(f"FAUTE_CERTAINE : {faults}")
+    print(f"A_VERIFIER : {checks}")
+    print(f"RAS : {ras}")
+    print(f"SKIP : {skipped}")
 
 if __name__ == "__main__":
     main()
